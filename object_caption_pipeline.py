@@ -71,8 +71,9 @@ class ObjectCaptionPipeline:
         # Initialize or use provided components
         if object_detector is None:
             logger.info("Initializing Grounding DINO detector...")
+            # Slightly lower threshold to catch smaller/farther objects typical in surveillance
             self.object_detector = GroundingDINODetector(
-                confidence_threshold=0.25,
+                confidence_threshold=0.22,
                 use_gpu=use_gpu
             )
         else:
@@ -95,6 +96,22 @@ class ObjectCaptionPipeline:
             "a close-up photo of the {label}. Describe color, material, and notable attributes",
             "describe the {label} focusing on color, style, and accessories",
             "{label}. Provide a short attribute-focused description (color, size, pattern)"
+        ]
+
+        # Default object prompts for classroom/surveillance contexts
+        self.default_object_prompts = [
+            # People
+            "person", "man", "woman",
+            # Bags and items often left on ground
+            "bag", "backpack", "duffel bag", "suitcase", "luggage", "bag on ground", "backpack on ground",
+            # Clothing/outerwear
+            "jacket", "coat",
+            # Personal electronics
+            "laptop", "tablet", "phone",
+            # Bottles/umbrellas
+            "bottle", "umbrella",
+            # Classroom fixtures
+            "desk", "chair", "bench", "whiteboard", "projector", "screen"
         ]
         
         # Common color words to help score candidate captions
@@ -130,9 +147,11 @@ class ObjectCaptionPipeline:
         
         try:
             # Step 1: Detect objects using Grounding DINO
+            # Use default prompts when none provided (classroom/surveillance tuned)
+            prompts = object_prompts or self.default_object_prompts
             detections = self.object_detector.detect_objects(
                 image=frame_data.image,
-                text_prompts=object_prompts,
+                text_prompts=prompts,
                 return_crops=True
             )
             
@@ -161,12 +180,25 @@ class ObjectCaptionPipeline:
             for idx, detection in enumerate(detections, 1):
                 if detection.cropped_image is None:
                     continue
-                
-                # Generate caption for cropped object
-                caption_text = self._caption_object(
-                    detection.cropped_image,
-                    detection.label
-                )
+                # Expand crop a bit to include context (straps, edges)
+                expanded_crop = self._expanded_crop(frame_data.image, detection.bbox, expand_ratio=0.15)
+
+                # Generate multiple candidate captions and pick best
+                candidates = []
+                cap1 = self._caption_object(detection.cropped_image, detection.label)
+                if cap1:
+                    candidates.append(cap1)
+                if expanded_crop is not None:
+                    cap2 = self._caption_object(expanded_crop, detection.label)
+                    if cap2:
+                        candidates.append(cap2)
+
+                caption_text = None
+                if candidates:
+                    # Score and choose best candidate
+                    scored = [(self._score_caption(c, detection.label), c) for c in candidates]
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    caption_text = scored[0][1]
                 
                 # Validate caption quality and uniqueness
                 if caption_text and len(caption_text.split()) >= 4:  # Increased minimum
@@ -315,6 +347,55 @@ class ObjectCaptionPipeline:
         except Exception as e:
             logger.error(f"Error captioning object {object_label}: {e}")
             return None
+
+    def _expanded_crop(self, image: Image.Image, bbox: Tuple[int, int, int, int], expand_ratio: float = 0.15) -> Optional[Image.Image]:
+        """Return an expanded crop around bbox to capture more context."""
+        try:
+            x1, y1, x2, y2 = bbox
+            w, h = x2 - x1, y2 - y1
+            dw, dh = int(w * expand_ratio), int(h * expand_ratio)
+            nx1 = max(0, x1 - dw)
+            ny1 = max(0, y1 - dh)
+            nx2 = min(image.width, x2 + dw)
+            ny2 = min(image.height, y2 + dh)
+            if nx2 - nx1 <= 1 or ny2 - ny1 <= 1:
+                return None
+            return image.crop((nx1, ny1, nx2, ny2))
+        except Exception:
+            return None
+
+    def _score_caption(self, caption: str, object_label: str) -> float:
+        """Heuristic score combining color words, label presence and length."""
+        if not caption:
+            return 0.0
+        c = caption.lower()
+        score = 0.0
+        # Reward color/material descriptors
+        for w in [
+            'black','white','grey','gray','red','blue','green','brown','beige','tan','leather','fabric','nylon'
+        ]:
+            if w in c:
+                score += 0.5
+        # Reward label/synonyms presence
+        syn = {
+            'backpack': ['backpack','bag','pack'],
+            'bag': ['bag','backpack','satchel','purse'],
+            'suitcase': ['suitcase','luggage'],
+            'jacket': ['jacket','coat'],
+            'coat': ['coat','jacket'],
+            'person': ['person','man','woman']
+        }
+        label_terms = syn.get(object_label.lower(), [object_label.lower()])
+        if any(t in c for t in label_terms):
+            score += 1.0
+        # Length preference
+        n = len(caption.split())
+        if 6 <= n <= 20:
+            score += 0.5
+        # Grammar check reuse
+        if self._is_grammatically_valid(caption):
+            score += 0.5
+        return score
     
     def _format_attribute_caption(self, blip_caption: str, object_label: str) -> str:
         """

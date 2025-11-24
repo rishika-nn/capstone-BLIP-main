@@ -14,14 +14,18 @@ torch==2.1.0
 torchvision==0.16.0
 transformers==4.35.2
 sentence-transformers==2.2.2
+# For multimodal embeddings (CLIP)
+timm>=0.6.12
 # For BGE model support
 FlagEmbedding>=1.2.0
 
 # Vector Database
 pinecone>=3.0.0
 
-# Optional but recommended
+# Temporal analysis and signal processing
 scipy==1.11.4
+
+# Optional but recommended
 scikit-learn==1.3.2
 matplotlib==3.8.1
 

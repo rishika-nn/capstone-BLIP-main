@@ -12,6 +12,7 @@ from tqdm import tqdm
 import gc
 from dataclasses import dataclass
 from frame_extractor import FrameData
+from sentence_transformers import SentenceTransformer, util
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -23,34 +24,64 @@ class CaptionedFrame:
     frame_data: FrameData
     caption: str
     confidence: Optional[float] = None
+    caption_variants: Optional[List[str]] = None  # Alternative captions for robustness
+    model_type: Optional[str] = None  # Model used for captioning
 
 class BlipCaptionGenerator:
     """Generate captions for frames using BLIP model"""
     
+    # Efficient model variants
+    EFFICIENT_MODELS = {
+        "base": "Salesforce/blip-image-captioning-base",  # Standard BLIP
+        "large": "Salesforce/blip-image-captioning-large",  # Larger, more accurate but slower
+        "tiny": "Salesforce/blip-image-captioning-tiny",  # Lightweight for mobile/edge
+        "object-focused": "Salesforce/blip-image-captioning-large",  # Optimized for objects (uses large model)
+    }
+    
     def __init__(self, 
                  model_name: str = "Salesforce/blip-image-captioning-base",
+                 model_type: str = "base",
                  batch_size: int = 8,
                  use_gpu: bool = True,
                  max_length: int = 50,
                  num_beams: int = 4,
                  generate_multiple_captions: bool = False,
-                 captions_per_frame: int = 3):
+                 captions_per_frame: int = 3,
+                 compute_confidence: bool = True,
+                 diversity_penalty: float = 0.5,
+                 enable_clip_rerank: bool = False,
+                 clip_rerank_model: Optional[str] = None):
         """
         Initialize the BLIP caption generator
         
         Args:
-            model_name: Hugging Face model identifier
+            model_name: Hugging Face model identifier or preset ('base', 'large', 'tiny', 'object-focused')
+            model_type: Type of model preset
             batch_size: Batch size for processing
             use_gpu: Whether to use GPU if available
             max_length: Maximum caption length
             num_beams: Number of beams for beam search
+            generate_multiple_captions: Whether to generate multiple caption variants
+            captions_per_frame: Number of caption variants per frame
+            compute_confidence: Whether to compute confidence scores for captions
+            diversity_penalty: Penalty for duplicate n-grams in beam search (for diversity)
         """
-        self.model_name = model_name
+        # Handle preset model names
+        if model_type in self.EFFICIENT_MODELS and model_name == "Salesforce/blip-image-captioning-base":
+            self.model_name = self.EFFICIENT_MODELS[model_type]
+        else:
+            self.model_name = model_name
+        
+        self.model_type = model_type
         self.batch_size = batch_size
         self.max_length = max_length
         self.num_beams = num_beams
         self.generate_multiple_captions = generate_multiple_captions
         self.captions_per_frame = captions_per_frame
+        self.compute_confidence = compute_confidence
+        self.diversity_penalty = diversity_penalty
+        self.enable_clip_rerank = enable_clip_rerank
+        self.clip_rerank_model_id = clip_rerank_model
         
         # Object-focused prompts for diverse, detailed captions
         self.object_prompts = [
@@ -65,6 +96,8 @@ class BlipCaptionGenerator:
         
         # Load model and processor
         self._load_model()
+        # Optionally load CLIP rerank model
+        self._load_rerank_model()
         
     def _load_model(self):
         """Load BLIP model and processor"""
@@ -91,6 +124,31 @@ class BlipCaptionGenerator:
         except Exception as e:
             logger.error(f"Failed to load BLIP model: {e}")
             raise
+
+    def _load_rerank_model(self):
+        """Optionally load CLIP/SentenceTransformer model for reranking."""
+        self.clip_model = None
+        if not self.enable_clip_rerank:
+            return
+        candidates = []
+        # Prefer explicit model id if provided
+        if self.clip_rerank_model_id:
+            candidates.append(self.clip_rerank_model_id)
+        # Common fallbacks
+        candidates.extend(['clip-ViT-B-32', 'openai/clip-vit-base-patch32'])
+        tried = []
+        for cid in candidates:
+            try:
+                device = 'cuda' if self.device.type == 'cuda' else 'cpu'
+                self.clip_model = SentenceTransformer(cid, device=device)
+                self.clip_model.eval()
+                logger.info(f"Loaded CLIP rerank model: {cid}")
+                return
+            except Exception as e:
+                tried.append((cid, str(e)))
+                logger.warning(f"Failed to load CLIP rerank model '{cid}': {e}")
+        logger.error(f"Could not load any CLIP rerank model from candidates: {[c[0] for c in tried]}")
+        # Leave clip_model as None; reranking will be skipped
     
     def generate_captions(self, frames: List[FrameData], 
                          filter_empty: bool = True,
@@ -116,17 +174,21 @@ class BlipCaptionGenerator:
             for frame_data in tqdm(frames, desc="Generating multi-captions"):
                 variants = self.generate_object_focused_captions(frame_data, 
                                                                  num_variants=self.captions_per_frame)
-                
-                for caption in variants:
-                    # Filter empty or short captions if requested
-                    if filter_empty and len(caption.split()) < min_caption_length:
-                        continue
-                    
-                    captioned_frame = CaptionedFrame(
-                        frame_data=frame_data,
-                        caption=caption
-                    )
-                    captioned_frames.append(captioned_frame)
+                # Optionally rerank with CLIP and keep only the best variant
+                chosen_caption = None
+                if self.enable_clip_rerank and getattr(self, 'clip_model', None) is not None and variants:
+                    chosen_caption = self._rerank_and_choose_best(frame_data, variants)
+                # Fallback: choose first valid if rerank disabled/failed
+                if not chosen_caption and variants:
+                    chosen_caption = variants[0]
+                if chosen_caption:
+                    if not (filter_empty and len(chosen_caption.split()) < min_caption_length):
+                        captioned_frame = CaptionedFrame(
+                            frame_data=frame_data,
+                            caption=chosen_caption,
+                            caption_variants=variants
+                        )
+                        captioned_frames.append(captioned_frame)
         else:
             # Process frames in batches (original behavior)
             for batch_start in tqdm(range(0, len(frames), self.batch_size), 
@@ -152,6 +214,25 @@ class BlipCaptionGenerator:
         
         logger.info(f"Generated {len(captioned_frames)} valid captions")
         return captioned_frames
+
+    def _rerank_and_choose_best(self, frame_data: FrameData, variants: List[str]) -> Optional[str]:
+        """Score caption variants against the image using CLIP and return the best caption."""
+        try:
+            image = frame_data.image
+            device = 'cuda' if self.device.type == 'cuda' else 'cpu'
+            # Encode image once
+            with torch.no_grad():
+                img_emb = self.clip_model.encode(image, convert_to_tensor=True, device=device, normalize_embeddings=True)
+            # Encode all text variants
+            with torch.no_grad():
+                txt_embs = self.clip_model.encode(variants, convert_to_tensor=True, device=device, normalize_embeddings=True)
+            # Compute cosine similarities
+            sims = util.cos_sim(img_emb, txt_embs).squeeze(0)  # shape: [num_variants]
+            best_idx = int(torch.argmax(sims).item())
+            return variants[best_idx]
+        except Exception as e:
+            logger.warning(f"CLIP reranking failed, falling back to first caption: {e}")
+            return variants[0] if variants else None
     
     def _generate_batch_captions(self, batch_frames: List[FrameData], 
                                   text_prompt: Optional[str] = None) -> List[str]:

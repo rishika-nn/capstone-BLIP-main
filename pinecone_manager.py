@@ -291,6 +291,62 @@ class PineconeManager:
         except Exception as e:
             logger.error(f"Query failed: {e}")
             return []
+
+    def query_index(self,
+                    index_name: str,
+                    query_vector: np.ndarray,
+                    top_k: int = 10,
+                    filter: Optional[Dict] = None,
+                    namespace: str = "",
+                    include_metadata: bool = True) -> List[SearchResult]:
+        """
+        Query a specific Pinecone index (useful for multi-index fusion)
+
+        Args:
+            index_name: Target index name
+            query_vector: Query embedding vector
+            top_k: Number of results to return
+            filter: Metadata filter (optional)
+            namespace: Namespace to query
+            include_metadata: Include metadata flag
+
+        Returns:
+            List of SearchResult objects
+        """
+        try:
+            # Connect to the requested index
+            idx = self.pc.Index(index_name)
+
+            query_vector_list = query_vector.tolist()
+
+            results = idx.query(
+                vector=query_vector_list,
+                top_k=top_k,
+                filter=filter,
+                namespace=namespace,
+                include_metadata=include_metadata
+            )
+
+            search_results = []
+            for match in results.get('matches', []):
+                metadata = match.get('metadata', {})
+
+                result = SearchResult(
+                    id=match['id'],
+                    score=match['score'],
+                    metadata=metadata,
+                    timestamp=metadata.get('timestamp', 0.0),
+                    caption=metadata.get('caption', ''),
+                    frame_id=metadata.get('frame_id', ''),
+                    video_name=metadata.get('video_name', '')
+                )
+                search_results.append(result)
+
+            return search_results
+
+        except Exception as e:
+            logger.error(f"Query failed for index '{index_name}': {e}")
+            return []
     
     def semantic_search(self,
                        query_embedding: np.ndarray,
@@ -407,6 +463,118 @@ class PineconeManager:
             all_results.append(results)
         
         return all_results
+
+    def upload_embeddings_to_index(self,
+                                   index_name: str,
+                                   dimension: int,
+                                   data: List[Tuple[str, List[float], Dict]],
+                                   batch_size: int = 100,
+                                   namespace: str = "",
+                                   max_retries: int = 3) -> int:
+        """
+        Upload embeddings to a specific Pinecone index (creates it if missing)
+
+        Args:
+            index_name: Name of the target index
+            dimension: Expected vector dimension for this index
+            data: List of (id, vector, metadata) tuples
+            batch_size: Batch size for uploads
+            namespace: Namespace within the index
+            max_retries: Max retries per batch
+
+        Returns:
+            Number of vectors uploaded
+        """
+        if not data:
+            logger.warning(f"No data to upload to index {index_name}")
+            return 0
+
+        # Ensure index exists
+        existing_indexes = self.pc.list_indexes()
+        if not any(idx.name == index_name for idx in existing_indexes):
+            logger.info(f"Index '{index_name}' does not exist; attempting to create it with dim={dimension}")
+            try:
+                if self.use_serverless:
+                    # Pinecone serverless requires a spec
+                    self.pc.create_index(
+                        name=index_name,
+                        dimension=dimension,
+                        metric=self.metric,
+                        spec=ServerlessSpec(
+                            cloud='aws',
+                            region=self.environment
+                        )
+                    )
+                else:
+                    # Pod-based creation
+                    self.pc.create_index(
+                        name=index_name,
+                        dimension=dimension,
+                        metric=self.metric,
+                        spec=PodSpec(
+                            environment=self.environment,
+                            pod_type='p1.x1',
+                            pods=1
+                        )
+                    )
+                time.sleep(5)
+                logger.info(f"Index '{index_name}' created")
+            except Exception as e:
+                logger.error(f"Failed to create index '{index_name}': {e}")
+                raise
+
+        # Connect to target index
+        idx = self.pc.Index(index_name)
+
+        uploaded_count = 0
+        failed_batches = []
+
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i + batch_size]
+            vectors = []
+            for item_id, vector, metadata in batch:
+                if not isinstance(vector, list):
+                    logger.error(f"Vector for {item_id} is not a list: {type(vector)}")
+                    continue
+                if len(vector) != dimension:
+                    logger.error(f"Vector dimension mismatch for {item_id}: {len(vector)} != {dimension}")
+                    continue
+                vectors.append({'id': item_id, 'values': vector, 'metadata': metadata})
+
+            if not vectors:
+                continue
+
+            success = False
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    response = idx.upsert(vectors=vectors, namespace=namespace)
+                    upserted = response.get('upserted_count', len(vectors))
+                    uploaded_count += upserted
+                    logger.info(f"Uploaded {upserted} vectors to index '{index_name}' (namespace='{namespace}')")
+                    success = True
+                    break
+                except Exception as batch_error:
+                    last_error = batch_error
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"Upload attempt {attempt+1} failed for index {index_name}, retrying in {wait_time}s")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Batch upload failed for index {index_name} after {max_retries} attempts: {batch_error}")
+                        failed_batches.append((i, batch, str(batch_error)))
+
+        if failed_batches:
+            logger.warning(f"Failed to upload {len(failed_batches)} batches to index '{index_name}'")
+
+        # Optionally check index stats
+        try:
+            stats = idx.describe_index_stats()
+            logger.info(f"Index '{index_name}' stats after upload: {stats.get('total_vector_count', 0)} vectors")
+        except Exception:
+            pass
+
+        return uploaded_count
     
     def delete_vectors(self,
                       ids: List[str],

@@ -27,6 +27,7 @@ class FrameData:
     phash: Optional[str] = None
     namespace: str = ""  # For object-based namespace organization
     video_date: str = ""  # Date when video was recorded (YYYY-MM-DD format)
+    thumbnail_path: Optional[str] = None
 
 class VideoFrameExtractor:
     """Extract and filter frames from video files"""
@@ -54,6 +55,7 @@ class VideoFrameExtractor:
         
     def extract_frames(self, video_path: str, 
                       use_similarity_filter: bool = True,
+                      dedupe_method: str = 'hist',
                       interval_seconds: Optional[float] = None,
                       video_date: str = "") -> List[FrameData]:
         """
@@ -90,9 +92,13 @@ class VideoFrameExtractor:
         logger.info(f"Video metadata - FPS: {fps:.2f}, Total frames: {total_frames}, "
                    f"Resolution: {width}x{height}, Duration: {duration:.2f}s")
         
-        # Extract frames
+        # Extract frames (support histogram or CLIP-based dedupe)
         if use_similarity_filter:
-            frames = self._extract_with_similarity_filter(cap, fps, total_frames)
+            if dedupe_method == 'clip':
+                frames = self._extract_with_clip_dedupe(cap, fps, total_frames,
+                                                       clip_threshold=self.CLIP_DEDUPE_THRESHOLD if hasattr(self, 'CLIP_DEDUPE_THRESHOLD') else 0.88)
+            else:
+                frames = self._extract_with_similarity_filter(cap, fps, total_frames)
         else:
             frames = self._extract_with_interval(cap, fps, total_frames, interval_seconds)
         
@@ -322,8 +328,121 @@ class VideoFrameExtractor:
         for frame_data in tqdm(self.frames_data, desc="Saving frames"):
             filename = f"{output_dir}/frame_{frame_data.frame_index:06d}_t{frame_data.timestamp:.2f}.jpg"
             frame_data.image.save(filename)
+            # Also write thumbnail and attach path
+            try:
+                thumb_dir = os.path.join(output_dir, 'thumbnails')
+                os.makedirs(thumb_dir, exist_ok=True)
+                thumb_path = os.path.join(thumb_dir, f"thumb_{frame_data.frame_index:06d}.jpg")
+                frame_data.image.copy().resize((256, 256)).save(thumb_path)
+                frame_data.thumbnail_path = thumb_path
+            except Exception:
+                # Non-fatal: continue saving main images
+                pass
         
         logger.info(f"Saved {len(self.frames_data)} frames to {output_dir}")
+
+    def _extract_with_clip_dedupe(self, cap, fps: float, total_frames: int, clip_threshold: float = 0.88) -> List[FrameData]:
+        """Extract frames using CLIP semantic deduplication"""
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as e:
+            logger.error("sentence-transformers is required for CLIP dedupe: %s", e)
+            # Fall back to histogram method
+            return self._extract_with_similarity_filter(cap, fps, total_frames)
+
+        # Lazy-load CLIP model (text+image support)
+        # Try loading a CLIP model with common ids and fall back gracefully
+        clip_model = None
+        tried = []
+        for candidate in [getattr(self, 'CLIP_MODEL_NAME', None), 'clip-ViT-B-32', 'openai/clip-vit-base-patch32']:
+            if not candidate:
+                continue
+            try:
+                clip_model = SentenceTransformer(candidate)
+                logger.info(f"Loaded CLIP model for dedupe: {candidate}")
+                break
+            except Exception as e:
+                tried.append((candidate, str(e)))
+                logger.warning(f"Failed to load CLIP model '{candidate}': {e}")
+
+        if clip_model is None:
+            logger.error(f"Could not load any CLIP model for dedupe. Tried: {[c[0] for c in tried]}")
+            # Fall back to histogram dedupe
+            return self._extract_with_similarity_filter(cap, fps, total_frames)
+
+        kept_frames: List[FrameData] = []
+        kept_embeddings = []  # normalized
+
+        frame_count = 0
+        pbar = tqdm(total=total_frames, desc="Extracting frames (CLIP dedupe)")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+            pbar.update(1)
+
+            # Resize for efficiency
+            if self.resize_width and frame.shape[1] != self.resize_width:
+                aspect_ratio = frame.shape[0] / frame.shape[1]
+                new_height = int(self.resize_width * aspect_ratio)
+                frame = cv2.resize(frame, (self.resize_width, new_height))
+
+            # Convert to PIL image
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+
+            # Create frame data
+            timestamp = frame_count / fps
+            frame_id = self._generate_frame_id(frame_count, timestamp)
+            frame_data = FrameData(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                frame_index=frame_count,
+                image=pil_image,
+                video_date=self.video_date
+            )
+
+            # Compute embedding for this frame
+            try:
+                emb = clip_model.encode(pil_image, convert_to_numpy=True, normalize_embeddings=True)
+            except Exception:
+                # If image encoding fails, fallback to histogram method decision
+                histogram = self._calculate_histogram(frame)
+                if not kept_frames:
+                    frame_data.histogram = histogram
+                    kept_frames.append(frame_data)
+                else:
+                    sim = self._compare_histograms(kept_frames[-1].histogram, histogram) if kept_frames[-1].histogram is not None else 0
+                    if sim < self.similarity_threshold:
+                        frame_data.histogram = histogram
+                        kept_frames.append(frame_data)
+                if len(kept_frames) >= self.max_frames:
+                    break
+                else:
+                    continue
+
+            # Compare with kept embeddings
+            if not kept_embeddings:
+                kept_embeddings.append(emb)
+                kept_frames.append(frame_data)
+            else:
+                kept_matrix = np.stack(kept_embeddings, axis=0)
+                # cosine since embeddings normalized -> dot product
+                sim_scores = np.dot(kept_matrix, emb)
+                max_sim = float(np.max(sim_scores))
+                if max_sim < clip_threshold:
+                    kept_embeddings.append(emb)
+                    kept_frames.append(frame_data)
+
+            if len(kept_frames) >= self.max_frames:
+                logger.warning(f"Reached maximum frame limit: {self.max_frames}")
+                break
+
+        pbar.close()
+        return kept_frames
 
 
 # Example usage and testing
